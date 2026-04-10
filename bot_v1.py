@@ -123,7 +123,11 @@ def get_forecast(city_slug: str) -> dict:
     hourly forecast (upcoming hours) to get the true daily maximum.
     """
     forecast_url = NWS_ENDPOINTS.get(city_slug)
-    station_id = STATION_IDS.get(city_slug)
+    station_id   = STATION_IDS.get(city_slug)
+    if not forecast_url or not station_id:
+        warn(f"No NWS endpoint/station configured for {city_slug}")
+        return {}
+
     daily_max = {}
     headers = {"User-Agent": "weatherbot/1.0"}
 
@@ -283,8 +287,10 @@ def run(dry_run: bool = True):
 
             if not dry_run:
                 balance += pos["cost"] + pnl
-                sim["wins"] += 1 if pnl > 0 else 0
-                sim["losses"] += 1 if pnl <= 0 else 0
+                if pnl >= 0:
+                    sim["wins"] += 1
+                else:
+                    sim["losses"] += 1
                 sim["trades"].append({
                     "type": "exit",
                     "question": pos["question"],
@@ -376,8 +382,6 @@ def run(dry_run: bool = True):
             position_size = round(balance * POSITION_PCT, 2)
             shares = position_size / price
 
-            ok(f"SIGNAL — buying {shares:.1f} shares @ ${price:.3f} = ${position_size:.2f}")
-
             if market_id in positions:
                 skip("Already in this market")
                 continue
@@ -389,6 +393,8 @@ def run(dry_run: bool = True):
             if position_size < 0.50:
                 skip(f"Position size ${position_size:.2f} too small")
                 continue
+
+            ok(f"SIGNAL — buying {shares:.1f} shares @ ${price:.3f} = ${position_size:.2f}")
 
             if not dry_run:
                 balance -= position_size

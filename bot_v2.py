@@ -98,13 +98,21 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """For regular buckets — exact match. For edge buckets — normal distribution."""
+    """
+    Probability that the actual max falls in [t_low, t_high] given the forecast
+    and its std error sigma. Integer temperature buckets are expanded by +/-0.5
+    to match the rounding used by Polymarket resolution.
+    """
     s = sigma or 2.0
+    f = float(forecast)
     if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
+        return norm_cdf((t_high + 0.5 - f) / s)
     if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    return 1.0 if in_bucket(forecast, t_low, t_high) else 0.0
+        return 1.0 - norm_cdf((t_low - 0.5 - f) / s)
+    if t_low == t_high:
+        # Exact-match bucket: treat as a +/-0.5 bin around the integer
+        return norm_cdf((t_low + 0.5 - f) / s) - norm_cdf((t_low - 0.5 - f) / s)
+    return norm_cdf((t_high + 0.5 - f) / s) - norm_cdf((t_low - 0.5 - f) / s)
 
 def calc_ev(p, price):
     if price <= 0 or price >= 1: return 0.0
@@ -408,6 +416,87 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # =============================================================================
+# BALANCE RECONCILIATION
+# The market JSON files are the ground truth. Incremental balance +=/-= in
+# scan_and_update and monitor_positions can drift if a bug ever lets a close
+# path double-credit. This reconciler recomputes balance, wins, losses, and
+# peak_balance directly from the ledger.
+# =============================================================================
+
+def calculate_balance_from_trades(state=None):
+    """Ground truth balance computed from market files."""
+    if state is None:
+        state = load_state()
+    starting = state.get("starting_balance", BALANCE)
+    total_cost     = 0.0
+    total_returned = 0.0
+    for m in load_all_markets():
+        pos = m.get("position")
+        if not pos:
+            continue
+        cost = float(pos.get("cost") or 0)
+        total_cost += cost
+        if pos.get("status") == "closed":
+            pnl = float(pos.get("pnl") or 0)
+            total_returned += cost + pnl
+    return round(starting - total_cost + total_returned, 2)
+
+def count_wins_losses_from_trades():
+    """Count wins and losses directly from resolved market files."""
+    wins = losses = 0
+    for m in load_all_markets():
+        if m.get("status") != "resolved":
+            continue
+        outcome = m.get("resolved_outcome")
+        if outcome == "win":
+            wins += 1
+        elif outcome == "loss":
+            losses += 1
+    return wins, losses
+
+def reconcile_balance(state, *, verbose=True):
+    """Detect and correct drift between state.balance and the ledger."""
+    computed = calculate_balance_from_trades(state)
+    drift = round(computed - state["balance"], 2)
+    if abs(drift) > 0.01:
+        if verbose:
+            print(f"  [RECONCILE] drift ${drift:+.2f} — "
+                  f"state ${state['balance']:.2f} -> ledger ${computed:.2f}")
+        state["balance"] = computed
+    # peak_balance should ratchet from the ledger, not from inflated state
+    state["peak_balance"] = max(
+        state.get("starting_balance", BALANCE),
+        state.get("peak_balance", computed),
+        computed,
+    )
+    return state
+
+def full_reconcile():
+    """One-shot recovery: rewrite state.json from the market ledger."""
+    state = load_state()
+    starting = state.get("starting_balance", BALANCE)
+    computed = calculate_balance_from_trades(state)
+    wins, losses = count_wins_losses_from_trades()
+    total_trades = sum(1 for m in load_all_markets() if m.get("position"))
+
+    print(f"  before: balance ${state['balance']:.2f}  "
+          f"peak ${state.get('peak_balance', starting):.2f}  "
+          f"W/L {state.get('wins', 0)}/{state.get('losses', 0)}  "
+          f"total {state.get('total_trades', 0)}")
+
+    state["balance"]      = computed
+    state["wins"]         = wins
+    state["losses"]       = losses
+    state["total_trades"] = total_trades
+    state["peak_balance"] = max(starting, computed)
+
+    save_state(state)
+    print(f"  after:  balance ${state['balance']:.2f}  "
+          f"peak ${state['peak_balance']:.2f}  "
+          f"W/L {wins}/{losses}  total {total_trades}")
+    return state
+
+# =============================================================================
 # CORE LOGIC
 # =============================================================================
 
@@ -572,7 +661,11 @@ def scan_and_update():
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
-            if mkt.get("position") and forecast_temp is not None:
+            # Must check status == "open" or this block re-credits balance
+            # every scan for already-closed positions.
+            if (mkt.get("position")
+                    and mkt["position"].get("status") == "open"
+                    and forecast_temp is not None):
                 pos = mkt["position"]
                 old_bucket_low  = pos["bucket_low"]
                 old_bucket_high = pos["bucket_high"]
@@ -711,6 +804,17 @@ def scan_and_update():
         if won is None:
             continue  # market still open
 
+        # Fetch actual temperature (for calibration and as a second source
+        # of truth). If VC_KEY isn't configured, fall back to the Polymarket
+        # outcome.
+        actual = None
+        if VC_KEY and VC_KEY != "YOUR_KEY_HERE":
+            actual = get_actual_temp(mkt["city"], mkt["date"])
+            if actual is not None:
+                mkt["actual_temp"] = actual
+                # Prefer the VC-derived truth over Polymarket's outcome
+                won = in_bucket(actual, pos["bucket_low"], pos["bucket_high"])
+
         # Market closed — record result
         price  = pos["entry_price"]
         size   = pos["cost"]
@@ -733,21 +837,23 @@ def scan_and_update():
             state["losses"] += 1
 
         result = "WIN" if won else "LOSS"
-        print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+        actual_str = f" | actual {actual}" if actual is not None else ""
+        print(f"  [{result}] {mkt['city_name']} {mkt['date']}{actual_str} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
         resolved += 1
 
         save_market(mkt)
         time.sleep(0.3)
 
-    state["balance"]      = round(balance, 2)
-    state["peak_balance"] = max(state.get("peak_balance", balance), balance)
+    state["balance"] = round(balance, 2)
+    # Reconcile against the ledger before persisting — catches any
+    # double-credit bugs instead of silently inflating the balance.
+    state = reconcile_balance(state)
     save_state(state)
 
     # Run calibration if enough data collected
     all_mkts = load_all_markets()
     resolved_count = len([m for m in all_mkts if m["status"] == "resolved"])
     if resolved_count >= CALIBRATION_MIN:
-        global _cal
         _cal = run_calibration(all_mkts)
 
     return new_pos, closed, resolved
@@ -942,9 +1048,11 @@ def monitor_positions():
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
 
-    if closed:
-        state["balance"] = round(balance, 2)
-        save_state(state)
+    state["balance"] = round(balance, 2)
+    # Always reconcile + persist, even when nothing closed, so any drift is
+    # caught promptly and peak_balance stays consistent.
+    state = reconcile_balance(state, verbose=bool(closed))
+    save_state(state)
 
     return closed
 
@@ -971,13 +1079,14 @@ def run_loop():
 
         # Full scan once per hour
         if now_ts - last_full_scan >= SCAN_INTERVAL:
+            # Mark the scan start time so long scans don't drift the cadence.
+            last_full_scan = now_ts
             print(f"[{now_str}] full scan...")
             try:
                 new_pos, closed, resolved = scan_and_update()
                 state = load_state()
                 print(f"  balance: ${state['balance']:,.2f} | "
                       f"new: {new_pos} | closed: {closed} | resolved: {resolved}")
-                last_full_scan = time.time()
             except KeyboardInterrupt:
                 print(f"\n  Stopping — saving state...")
                 save_state(load_state())
@@ -1024,5 +1133,12 @@ if __name__ == "__main__":
     elif cmd == "report":
         _cal = load_cal()
         print_report()
+    elif cmd == "reconcile":
+        # One-shot recovery: rewrite state.json from the market ledger.
+        print(f"\n{'='*55}")
+        print(f"  WEATHERBET — RECONCILE")
+        print(f"{'='*55}")
+        full_reconcile()
+        print(f"{'='*55}\n")
     else:
-        print("Usage: python weatherbet.py [run|status|report]")
+        print("Usage: python bot_v2.py [run|status|report|reconcile]")
