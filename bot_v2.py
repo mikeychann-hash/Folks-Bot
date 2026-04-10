@@ -452,15 +452,18 @@ def calculate_balance_from_trades(state=None):
     return round(starting - total_cost + total_returned, 2)
 
 def count_wins_losses_from_trades():
-    """Count wins and losses directly from resolved market files."""
+    """Count wins and losses from every closed position in the ledger.
+    Matches the filter used by print_report / print_status so the numbers
+    stay consistent across state.json, reports, and the reconcile command."""
     wins = losses = 0
     for m in load_all_markets():
-        if m.get("status") != "resolved":
+        pos = m.get("position")
+        if not pos or pos.get("status") != "closed":
             continue
-        outcome = m.get("resolved_outcome")
-        if outcome == "win":
+        pnl = float(pos.get("pnl") or 0)
+        if pnl >= 0:
             wins += 1
-        elif outcome == "loss":
+        else:
             losses += 1
     return wins, losses
 
@@ -509,6 +512,17 @@ def full_reconcile():
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
+
+def record_close(state, mkt, pos, pnl):
+    """Stamp terminal close metadata on the market and update win/loss stats.
+    Called from every close path (stop, trailing, forecast_changed, take,
+    and auto-resolution) so every closed position is reflected in stats."""
+    mkt["pnl"] = pnl
+    mkt["resolved_outcome"] = "win" if pnl >= 0 else "loss"
+    if pnl >= 0:
+        state["wins"] = state.get("wins", 0) + 1
+    else:
+        state["losses"] = state.get("losses", 0) + 1
 
 def take_forecast_snapshot(city_slug, dates):
     """Fetches forecasts from all sources and returns a snapshot."""
@@ -666,6 +680,7 @@ def scan_and_update():
                         pos["exit_price"]   = current_price
                         pos["pnl"]          = pnl
                         pos["status"]       = "closed"
+                        record_close(state, mkt, pos, pnl)
                         closed += 1
                         reason = "STOP" if current_price < entry else "TRAILING BE"
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
@@ -703,6 +718,7 @@ def scan_and_update():
                         mkt["position"]["exit_price"]   = current_price
                         mkt["position"]["pnl"]          = pnl
                         mkt["position"]["status"]       = "closed"
+                        record_close(state, mkt, mkt["position"], pnl)
                         closed += 1
                         print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
@@ -842,14 +858,8 @@ def scan_and_update():
         pos["close_reason"] = "resolved"
         pos["closed_at"]    = now.isoformat()
         pos["status"]       = "closed"
-        mkt["pnl"]          = pnl
         mkt["status"]       = "resolved"
-        mkt["resolved_outcome"] = "win" if won else "loss"
-
-        if won:
-            state["wins"] += 1
-        else:
-            state["losses"] += 1
+        record_close(state, mkt, pos, pnl)
 
         result = "WIN" if won else "LOSS"
         actual_str = f" | actual {actual}" if actual is not None else ""
@@ -881,7 +891,12 @@ def print_status():
     state    = load_state()
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
+    # "closed" here means any terminal close — early exit via stop / trailing
+    # / take-profit / forecast-changed, or full auto-resolution on Polymarket.
+    resolved = [m for m in markets
+                if m.get("position")
+                and m["position"].get("status") == "closed"
+                and m.get("pnl") is not None]
 
     bal     = state["balance"]
     start   = state["starting_balance"]
@@ -931,7 +946,12 @@ def print_status():
 
 def print_report():
     markets  = load_all_markets()
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
+    # Include every closed position, not just those auto-resolved on
+    # Polymarket. Stop-outs and take-profits are real trades too.
+    resolved = [m for m in markets
+                if m.get("position")
+                and m["position"].get("status") == "closed"
+                and m.get("pnl") is not None]
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — FULL REPORT")
@@ -941,9 +961,16 @@ def print_report():
         print("  No resolved markets yet.")
         return
 
+    # Infer outcome from pnl sign for any legacy rows missing resolved_outcome.
+    def _outcome(m):
+        o = m.get("resolved_outcome")
+        if o in ("win", "loss"):
+            return o
+        return "win" if (m.get("pnl") or 0) >= 0 else "loss"
+
     total_pnl = sum(m["pnl"] for m in resolved)
-    wins      = [m for m in resolved if m["resolved_outcome"] == "win"]
-    losses    = [m for m in resolved if m["resolved_outcome"] == "loss"]
+    wins      = [m for m in resolved if _outcome(m) == "win"]
+    losses    = [m for m in resolved if _outcome(m) == "loss"]
 
     print(f"\n  Total resolved: {len(resolved)}")
     print(f"  Wins:           {len(wins)} | Losses: {len(losses)}")
@@ -953,7 +980,7 @@ def print_report():
     print(f"\n  By city:")
     for city in sorted(set(m["city"] for m in resolved)):
         group = [m for m in resolved if m["city"] == city]
-        w     = len([m for m in group if m["resolved_outcome"] == "win"])
+        w     = len([m for m in group if _outcome(m) == "win"])
         pnl   = sum(m["pnl"] for m in group)
         name  = LOCATIONS[city]["name"]
         print(f"    {name:<16} {w}/{len(group)} ({w/len(group):.0%})  PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
@@ -966,7 +993,7 @@ def print_report():
         first_fc = snaps[0]["best"] if snaps else None
         last_fc  = snaps[-1]["best"] if snaps else None
         label    = f"{pos.get('bucket_low')}-{pos.get('bucket_high')}{unit_sym}" if pos else "no position"
-        result   = m["resolved_outcome"].upper()
+        result   = _outcome(m).upper()
         pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
         fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
         actual   = f"actual {m.get('actual_temp')}{unit_sym}" if m.get("actual_temp") is not None else ""
@@ -1059,6 +1086,7 @@ def monitor_positions():
             pos["exit_price"]   = current_price
             pos["pnl"]          = pnl
             pos["status"]       = "closed"
+            record_close(state, mkt, pos, pnl)
             closed += 1
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
