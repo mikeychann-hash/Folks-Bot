@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-weatherbet.py — Weather Trading Bot for Polymarket
-=====================================================
-Tracks weather forecasts from 3 sources (ECMWF, HRRR, METAR),
-compares with Polymarket markets, paper trades using Kelly criterion.
+bot_v2.py — WeatherBet Full Bot for Polymarket
+==============================================
+Tracks weather forecasts from 3 sources (ECMWF, HRRR, METAR) across 20
+cities on 4 continents, compares with Polymarket temperature markets,
+and paper trades using expected value + fractional Kelly sizing.
 
 Usage:
-    python weatherbet.py          # main loop
-    python weatherbet.py report   # full report
-    python weatherbet.py status   # balance and open positions
+    python bot_v2.py              # main loop (scans hourly, monitors every 10 min)
+    python bot_v2.py status       # balance and open positions
+    python bot_v2.py report       # full breakdown of every closed position
+    python bot_v2.py reconcile    # rewrite state.json from the market ledger
 """
 
 import os
@@ -21,6 +23,7 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # =============================================================================
 # CONFIG
@@ -154,8 +157,14 @@ def get_sigma(city_slug, source="ecmwf"):
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    """Recalculates sigma from resolved markets.
+
+    Uses the most recent non-null forecast value from each source per
+    resolved market as the prediction, and compares against actual_temp
+    (populated by get_actual_temp in the auto-resolution path)."""
+    resolved = [m for m in markets
+                if m.get("status") == "resolved"
+                and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
 
@@ -164,10 +173,16 @@ def run_calibration(markets):
             group = [m for m in resolved if m["city"] == city]
             errors = []
             for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
-                if snap and snap.get("temp") is not None:
-                    errors.append(abs(snap["temp"] - m["actual_temp"]))
+                # Walk snapshots newest-first, use the first one that has a
+                # non-null value for this source.
+                snap_value = None
+                for s in reversed(m.get("forecast_snapshots", [])):
+                    v = s.get(source)
+                    if v is not None:
+                        snap_value = v
+                        break
+                if snap_value is not None:
+                    errors.append(abs(snap_value - m["actual_temp"]))
             if len(errors) < CALIBRATION_MIN:
                 continue
             mae  = sum(errors) / len(errors)
@@ -468,20 +483,42 @@ def count_wins_losses_from_trades():
     return wins, losses
 
 def reconcile_balance(state, *, verbose=True):
-    """Detect and correct drift between state.balance and the ledger."""
-    computed = calculate_balance_from_trades(state)
-    drift = round(computed - state["balance"], 2)
+    """Detect and correct drift between state and the ledger.
+
+    Reconciles balance, wins, losses, and peak_balance so the market
+    files are the single source of truth. Any accounting bug that ever
+    drifts these numbers gets corrected (and loudly logged) on the next
+    save, instead of silently compounding."""
+    computed_bal    = calculate_balance_from_trades(state)
+    computed_wins, computed_losses = count_wins_losses_from_trades()
+
+    drift = round(computed_bal - state["balance"], 2)
     if abs(drift) > 0.01:
         if verbose:
             print(f"  [RECONCILE] drift ${drift:+.2f} — "
-                  f"state ${state['balance']:.2f} -> ledger ${computed:.2f}")
-        state["balance"] = computed
-    # peak_balance should ratchet from the ledger, not from inflated state
-    state["peak_balance"] = max(
-        state.get("starting_balance", BALANCE),
-        state.get("peak_balance", computed),
-        computed,
-    )
+                  f"state ${state['balance']:.2f} -> ledger ${computed_bal:.2f}")
+        state["balance"] = computed_bal
+
+    if (state.get("wins", 0) != computed_wins
+            or state.get("losses", 0) != computed_losses):
+        if verbose:
+            print(f"  [RECONCILE] W/L {state.get('wins', 0)}/{state.get('losses', 0)} "
+                  f"-> {computed_wins}/{computed_losses}")
+        state["wins"]   = computed_wins
+        state["losses"] = computed_losses
+
+    # peak_balance: if the balance drifted, the stored peak almost certainly
+    # ratcheted up off the drift, so reset it to max(starting, computed).
+    # Otherwise ratchet normally.
+    starting = state.get("starting_balance", BALANCE)
+    if abs(drift) > 0.01:
+        state["peak_balance"] = max(starting, computed_bal)
+    else:
+        state["peak_balance"] = max(
+            starting,
+            state.get("peak_balance", computed_bal),
+            computed_bal,
+        )
     return state
 
 def full_reconcile():
@@ -525,18 +562,24 @@ def record_close(state, mkt, pos, pnl):
         state["losses"] = state.get("losses", 0) + 1
 
 def take_forecast_snapshot(city_slug, dates):
-    """Fetches forecasts from all sources and returns a snapshot."""
-    now_str = datetime.now(timezone.utc).isoformat()
-    ecmwf   = get_ecmwf(city_slug, dates)
-    hrrr    = get_hrrr(city_slug, dates)
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """Fetches forecasts from all sources and returns a snapshot.
+    Uses the city's local timezone for the "today" and "D+2" comparisons
+    so they agree with the date keys returned by Open-Meteo (which we
+    request in local time) and with Polymarket market slugs."""
+    now_str  = datetime.now(timezone.utc).isoformat()
+    ecmwf    = get_ecmwf(city_slug, dates)
+    hrrr     = get_hrrr(city_slug, dates)
+    tz       = ZoneInfo(TIMEZONES.get(city_slug, "UTC"))
+    now_local = datetime.now(tz)
+    today    = now_local.strftime("%Y-%m-%d")
+    d_plus_2 = (now_local + timedelta(days=2)).strftime("%Y-%m-%d")
 
     snapshots = {}
     for date in dates:
         snap = {
             "ts":    now_str,
             "ecmwf": ecmwf.get(date),
-            "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
+            "hrrr":  hrrr.get(date) if date <= d_plus_2 else None,
             "metar": get_metar(city_slug) if date == today else None,
         }
         # Best forecast: HRRR for US D+0/D+1, otherwise ECMWF
@@ -569,7 +612,15 @@ def scan_and_update():
         print(f"  -> {loc['name']}...", end=" ", flush=True)
 
         try:
-            dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
+            # Generate dates in the city's local timezone. Open-Meteo's
+            # daily output is keyed by local date, and Polymarket slugs
+            # ("highest-temperature-in-tokyo-on-march-7-2024") use the
+            # local date too — using UTC dates here would drop or mis-key
+            # a day for every city east of UTC during the second half of
+            # the UTC day.
+            tz = ZoneInfo(TIMEZONES.get(city_slug, "UTC"))
+            now_local = datetime.now(tz)
+            dates = [(now_local + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
             snapshots = take_forecast_snapshot(city_slug, dates)
             time.sleep(0.3)
         except Exception as e:
@@ -887,6 +938,15 @@ def scan_and_update():
 # REPORT
 # =============================================================================
 
+def _market_pnl(m):
+    """Return the authoritative pnl for a market, preferring the top-level
+    field (set by record_close) but falling back to the position's own pnl
+    so legacy market files without record_close still render correctly."""
+    pnl = m.get("pnl")
+    if pnl is None and m.get("position"):
+        pnl = m["position"].get("pnl")
+    return pnl
+
 def print_status():
     state    = load_state()
     markets  = load_all_markets()
@@ -896,7 +956,7 @@ def print_status():
     resolved = [m for m in markets
                 if m.get("position")
                 and m["position"].get("status") == "closed"
-                and m.get("pnl") is not None]
+                and _market_pnl(m) is not None]
 
     bal     = state["balance"]
     start   = state["starting_balance"]
@@ -951,7 +1011,7 @@ def print_report():
     resolved = [m for m in markets
                 if m.get("position")
                 and m["position"].get("status") == "closed"
-                and m.get("pnl") is not None]
+                and _market_pnl(m) is not None]
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — FULL REPORT")
@@ -966,9 +1026,9 @@ def print_report():
         o = m.get("resolved_outcome")
         if o in ("win", "loss"):
             return o
-        return "win" if (m.get("pnl") or 0) >= 0 else "loss"
+        return "win" if (_market_pnl(m) or 0) >= 0 else "loss"
 
-    total_pnl = sum(m["pnl"] for m in resolved)
+    total_pnl = sum(_market_pnl(m) or 0 for m in resolved)
     wins      = [m for m in resolved if _outcome(m) == "win"]
     losses    = [m for m in resolved if _outcome(m) == "loss"]
 
@@ -981,7 +1041,7 @@ def print_report():
     for city in sorted(set(m["city"] for m in resolved)):
         group = [m for m in resolved if m["city"] == city]
         w     = len([m for m in group if _outcome(m) == "win"])
-        pnl   = sum(m["pnl"] for m in group)
+        pnl   = sum(_market_pnl(m) or 0 for m in group)
         name  = LOCATIONS[city]["name"]
         print(f"    {name:<16} {w}/{len(group)} ({w/len(group):.0%})  PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
@@ -994,7 +1054,8 @@ def print_report():
         last_fc  = snaps[-1]["best"] if snaps else None
         label    = f"{pos.get('bucket_low')}-{pos.get('bucket_high')}{unit_sym}" if pos else "no position"
         result   = _outcome(m).upper()
-        pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
+        pnl_val  = _market_pnl(m)
+        pnl_str  = f"{'+'if pnl_val>=0 else ''}{pnl_val:.2f}" if pnl_val is not None else "-"
         fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
         actual   = f"actual {m.get('actual_temp')}{unit_sym}" if m.get("actual_temp") is not None else ""
         print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
