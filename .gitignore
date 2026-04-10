@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Bot runtime state — market files, state, calibration, simulation
+data/
+simulation.json
+*.tmp

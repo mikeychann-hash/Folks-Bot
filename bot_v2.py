@@ -12,6 +12,7 @@ Usage:
     python weatherbet.py status   # balance and open positions
 """
 
+import os
 import re
 import sys
 import json
@@ -50,6 +51,13 @@ STATE_FILE       = DATA_DIR / "state.json"
 MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
+
+def _atomic_write_text(path: Path, text: str):
+    """Atomic JSON write — write to temp file then os.replace into place.
+    Prevents Ctrl+C / crash from corrupting state files mid-write."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 LOCATIONS = {
     "nyc":          {"lat": 40.7772,  "lon":  -73.8726, "name": "New York City", "station": "KLGA", "unit": "F", "region": "us"},
@@ -170,7 +178,7 @@ def run_calibration(markets):
             if abs(new - old) > 0.05:
                 updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
 
-    CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    _atomic_write_text(CALIBRATION_FILE, json.dumps(cal, indent=2))
     if updated:
         print(f"  [CAL] {', '.join(updated)}")
     return cal
@@ -307,8 +315,10 @@ def get_polymarket_event(city_slug, month, day, year):
         data = r.json()
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
-    except Exception:
-        pass
+    except Exception as e:
+        # Log real network/API errors. Empty result (no matching event) is
+        # normal and returns None silently without raising.
+        print(f"  [POLY] {city_slug} {month} {day}: {e}")
     return None
 
 def get_market_price(market_id):
@@ -364,7 +374,7 @@ def load_market(city_slug, date_str):
 
 def save_market(market):
     p = market_path(market["city"], market["date"])
-    p.write_text(json.dumps(market, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(p, json.dumps(market, indent=2, ensure_ascii=False))
 
 def load_all_markets():
     markets = []
@@ -413,7 +423,7 @@ def load_state():
     }
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False))
 
 # =============================================================================
 # BALANCE RECONCILIATION
@@ -660,21 +670,26 @@ def scan_and_update():
                         reason = "STOP" if current_price < entry else "TRAILING BE"
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
-            # --- CLOSE POSITION if forecast shifted 2+ degrees ---
+            # --- CLOSE POSITION if forecast shifted outside the bucket ---
             # Must check status == "open" or this block re-credits balance
             # every scan for already-closed positions.
             if (mkt.get("position")
                     and mkt["position"].get("status") == "open"
                     and forecast_temp is not None):
                 pos = mkt["position"]
-                old_bucket_low  = pos["bucket_low"]
-                old_bucket_high = pos["bucket_high"]
-                # 2-degree buffer — avoid closing on small forecast fluctuations
-                unit = loc["unit"]
-                buffer = 2.0 if unit == "F" else 1.0
-                mid_bucket = (old_bucket_low + old_bucket_high) / 2 if old_bucket_low != -999 and old_bucket_high != 999 else forecast_temp
-                forecast_far = abs(forecast_temp - mid_bucket) > (abs(mid_bucket - old_bucket_low) + buffer)
-                if not in_bucket(forecast_temp, old_bucket_low, old_bucket_high) and forecast_far:
+                low  = pos["bucket_low"]
+                high = pos["bucket_high"]
+                # Close if forecast is at least `buffer` degrees beyond the
+                # bucket edge. Works for ranged AND edge (-999 / 999) buckets.
+                buffer = 2.0 if loc["unit"] == "F" else 1.0
+                if low == -999:
+                    forecast_far = forecast_temp > high + buffer
+                elif high == 999:
+                    forecast_far = forecast_temp < low - buffer
+                else:
+                    forecast_far = (forecast_temp < low - buffer
+                                    or forecast_temp > high + buffer)
+                if forecast_far:
                     current_price = None
                     for o in outcomes:
                         if o["market_id"] == pos["market_id"]:
@@ -954,7 +969,7 @@ def print_report():
         result   = m["resolved_outcome"].upper()
         pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
         fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
-        actual   = f"actual {m['actual_temp']}{unit_sym}" if m["actual_temp"] else ""
+        actual   = f"actual {m.get('actual_temp')}{unit_sym}" if m.get("actual_temp") is not None else ""
         print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
 
     print(f"{'='*55}\n")

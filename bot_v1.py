@@ -15,6 +15,7 @@ import json
 import argparse
 import requests
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # =============================================================================
 # CONFIG
@@ -54,6 +55,17 @@ NWS_ENDPOINTS = {
 STATION_IDS = {
     "nyc": "KLGA", "chicago": "KORD", "miami": "KMIA",
     "dallas": "KDAL", "seattle": "KSEA", "atlanta": "KATL",
+}
+
+# Local timezones — used to bucket NWS observations/forecasts by the city's
+# *local* calendar day rather than by UTC date.
+TIMEZONES = {
+    "nyc":     "America/New_York",
+    "chicago": "America/Chicago",
+    "miami":   "America/New_York",
+    "dallas":  "America/Chicago",
+    "seattle": "America/Los_Angeles",
+    "atlanta": "America/New_York",
 }
 
 ACTIVE_LOCATIONS = _cfg.get("locations", "nyc,chicago,miami,dallas,seattle,atlanta").split(",")
@@ -130,6 +142,17 @@ def get_forecast(city_slug: str) -> dict:
 
     daily_max = {}
     headers = {"User-Agent": "weatherbot/1.0"}
+    tz = ZoneInfo(TIMEZONES.get(city_slug, "UTC"))
+
+    def _local_date(ts: str):
+        """Parse an ISO timestamp and return the city's local YYYY-MM-DD."""
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone(tz).strftime("%Y-%m-%d")
+        except Exception:
+            return None
 
     # Real observations — what already happened today
     try:
@@ -137,12 +160,14 @@ def get_forecast(city_slug: str) -> dict:
         r = requests.get(obs_url, timeout=10, headers=headers)
         for obs in r.json().get("features", []):
             props = obs["properties"]
-            time_str = props.get("timestamp", "")[:10]
+            date = _local_date(props.get("timestamp", ""))
+            if not date:
+                continue
             temp_c = props.get("temperature", {}).get("value")
             if temp_c is not None:
                 temp_f = round(temp_c * 9/5 + 32)
-                if time_str not in daily_max or temp_f > daily_max[time_str]:
-                    daily_max[time_str] = temp_f
+                if date not in daily_max or temp_f > daily_max[date]:
+                    daily_max[date] = temp_f
     except Exception as e:
         warn(f"Observations error for {city_slug}: {e}")
 
@@ -151,7 +176,9 @@ def get_forecast(city_slug: str) -> dict:
         r = requests.get(forecast_url, timeout=10, headers=headers)
         periods = r.json()["properties"]["periods"]
         for p in periods:
-            date = p["startTime"][:10]
+            date = _local_date(p.get("startTime", ""))
+            if not date:
+                continue
             temp = p["temperature"]
             if p.get("temperatureUnit") == "C":
                 temp = round(temp * 9/5 + 32)
@@ -184,16 +211,17 @@ def get_polymarket_event(city_slug: str, month: str, day: int, year: int):
 # =============================================================================
 
 def parse_temp_range(question: str):
-    """Extract temperature range from a market question"""
+    """Extract temperature range from a market question (accepts F or C)."""
     if not question:
         return None
-    if "or below" in question.lower():
-        m = re.search(r'(\d+)°F or below', question, re.IGNORECASE)
+    q = question
+    if "or below" in q.lower():
+        m = re.search(r'(-?\d+)[°]?[FC] or below', q, re.IGNORECASE)
         if m: return (-999, int(m.group(1)))
-    if "or higher" in question.lower():
-        m = re.search(r'(\d+)°F or higher', question, re.IGNORECASE)
+    if "or higher" in q.lower():
+        m = re.search(r'(-?\d+)[°]?[FC] or higher', q, re.IGNORECASE)
         if m: return (int(m.group(1)), 999)
-    m = re.search(r'between (\d+)-(\d+)°F', question, re.IGNORECASE)
+    m = re.search(r'between (-?\d+)-(-?\d+)[°]?[FC]', q, re.IGNORECASE)
     if m: return (int(m.group(1)), int(m.group(2)))
     return None
 
@@ -321,8 +349,11 @@ def run(dry_run: bool = True):
         if not forecast:
             continue
 
+        # Iterate dates in the city's local calendar — must match the
+        # date-keying used inside get_forecast() and by Polymarket's slug.
+        tz = ZoneInfo(TIMEZONES.get(city_slug, "UTC"))
         for i in range(0, 4):
-            date = datetime.now() + timedelta(days=i)
+            date = datetime.now(tz) + timedelta(days=i)
             date_str = date.strftime("%Y-%m-%d")
             month = MONTHS[date.month - 1]
             day = date.day
